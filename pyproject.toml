@@ -1,0 +1,22 @@
+[project]
+name = "deploy-master"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Mr. JS", email = "dev@mr-js.ru" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "fabric>=3.2.3",
+    "keyring>=25.7.0",
+    "scp>=0.16.1",
+    "tqdm>=4.70.0",
+]
+
+[project.scripts]
+deploy-master = "deploy_master.main:main"
+
+[build-system]
+requires = ["uv_build>=0.12.11,<0.13.0"]
+build-backend = "uv_build"
