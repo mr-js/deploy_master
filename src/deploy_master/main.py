@@ -1,24 +1,77 @@
 import argparse
-from enum import IntEnum
 import getpass
 import hashlib
 import importlib.util
 import os
-from pathlib import Path
 import sys
-from fabric import Connection
+import time
+from enum import Enum
+from pathlib import Path
+
 import keyring
+import pathspec
+from fabric import Connection
 from scp import SCPClient
 from tqdm import tqdm
 
+RESET = "\033[0m"
+RED = "\033[38;5;196m"
+GREEN = "\033[38;5;46m"
+ORANGE = "\033[38;5;214m"
+YELLOW = "\033[38;5;226m"
+CYAN = "\033[38;5;51m"
+BLUE = "\033[38;5;39m"
+GRAY = "\033[38;5;245m"
 
-class ClearDestinationMode(IntEnum):
-    KEEP_ALL = 0
-    SYNC_DELETE = 1
-    PURGE_ALL = 2
+
+class Mode(str, Enum):
+    UPDATE = "UPDATE"
+    UPDATE_FORCE = "UPDATE_FORCE"
+    REWRITE = "REWRITE"
+    REWRITE_FORCE = "REWRITE_FORCE"
+    CLEAR = "CLEAR"
+    CLEAR_FORCE = "CLEAR_FORCE"
 
 
-DEFAULT_IGNORED = {".git", ".idea", "__pycache__", ".venv", "venv", ".env", ".restart-app"}
+class ActionCondition(str, Enum):
+    NEVER = "NEVER"
+    ALWAYS = "ALWAYS"
+    ON_CLEAR = "ON_CLEAR"
+    ON_UPDATE = "ON_UPDATE"
+
+
+FALLBACK_IGNORED_LOCAL = [
+    "__pycache__/", "*.py[codz]", "*$py.class", "*.so", ".Python", "build/",
+    "develop-eggs/", "dist/", "downloads/", "eggs/", ".eggs/", "lib/",
+    "lib64/", "parts/", "sdist/", "var/", "wheels/", "share/python-wheels/",
+    "*.egg-info/", ".installed.cfg", "*.egg", "MANIFEST", "*.manifest",
+    "*.spec", "pip-log.txt", "pip-delete-this-directory.txt", "htmlcov/",
+    ".tox/", ".nox/", ".coverage", ".coverage.*", ".cache", "nosetests.xml",
+    "coverage.xml", "*.cover", "*.py.cover", "*.lcov", ".hypothesis/",
+    ".pytest_cache/", "cover/", "*.mo", "*.pot", "*.log", "local_settings.py",
+    "db.sqlite3", "db.sqlite3-journal", "instance/", ".webassets-cache",
+    ".scrapy", "docs/_build/", ".pybuilder/", "target/", ".ipynb_checkpoints",
+    "profile_default/", "ipython_config.py", ".pdm-python", ".pdm-build/",
+    ".pixi/*", "!.pixi/config.toml", "__pypackages__/", "celerybeat-schedule*",
+    "celerybeat.pid", "*.rdb", "*.aof", "*.pid", "mnesia/", "rabbitmq/",
+    "rabbitmq-data/", "activemq-data/", "*.sage.py", ".env", ".envrc",
+    ".venv", "env/", "venv/", "ENV/", "env.bak/", "venv.bak/", ".spyderproject",
+    ".spyproject", ".ropeproject", ".idea/", ".vscode/", "/site", ".mypy_cache/",
+    ".dmypy.json", "dmypy.json", ".pyre/", ".pytype/", "cython_debug/",
+    ".abstra/", "tempCodeRunnerFile.py", ".ruff_cache/", ".pypirc",
+    "marimo/_static/", "marimo/_lsp/", "__marimo__/", ".streamlit/secrets.toml",
+    ".git/", ".gitignore"
+]
+
+FALLBACK_IGNORED_SERVER = [
+    ".restart-app"
+]
+
+
+def get_program_dir() -> str:
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
 
 
 def calculate_local_md5(filepath: str) -> str:
@@ -46,30 +99,15 @@ def get_remote_md5_map(conn: Connection, remote_dir: str) -> dict:
     return remote_map
 
 
-def get_remote_dirs(conn: Connection, remote_dir: str) -> set:
-    conn.run(f'mkdir -p "{remote_dir}"', hide=True)
-    cmd = f'cd "{remote_dir}" && find . -mindepth 1 -type d'
-    res = conn.run(cmd, hide=True, warn=True)
-    if not res.ok or not res.stdout.strip():
-        return set()
-
-    dirs = set()
-    for line in res.stdout.strip().splitlines():
-        rel_path = line.replace("./", "", 1).strip()
-        if rel_path:
-            dirs.add(rel_path)
-    return dirs
-
-
 def get_or_set_password(service: str, username: str) -> str:
     password = keyring.get_password(service, username)
     if not password:
-        print(f"Warning: Password not found in keyring for service '{service}' and user '{username}'.")
+        print(f"{YELLOW}Warning: Password not found in keyring for '{service}' and user '{username}'.{RESET}")
         choice = input("Would you like to enter and save it now? [y/N]: ").strip().lower()
         if choice in ("y", "yes"):
             password = getpass.getpass("Enter password: ")
             keyring.set_password(service, username, password)
-            print("Password saved to keyring successfully.")
+            print(f"{GREEN}Password saved to keyring successfully.{RESET}")
         else:
             password = getpass.getpass("Enter password (session only, not saved): ")
     return password
@@ -78,7 +116,7 @@ def get_or_set_password(service: str, username: str) -> str:
 def load_config_file(config_path: str) -> dict:
     resolved_path = Path(config_path).resolve()
     if not resolved_path.exists():
-        raise FileNotFoundError(f"Config file not found: {resolved_path}")
+        return {}
 
     spec = importlib.util.spec_from_file_location("dynamic_config", resolved_path)
     if spec is None or spec.loader is None:
@@ -101,187 +139,214 @@ def deploy(
     service: str,
     source: str,
     destination: str,
-    clear_mode: ClearDestinationMode = ClearDestinationMode.SYNC_DELETE,
-    restart_file: str = ".restart-app",
-    ignored: set = None,
+    mode: Mode,
+    action_condition: ActionCondition,
+    action_after: str,
+    action_check: str,
+    preview: bool,
+    local_ignored: list,
+    server_ignored: list,
 ):
-    if ignored is None:
-        ignored = DEFAULT_IGNORED
-
     password = get_or_set_password(service, username)
 
-    print(f"Connecting to {username}@{host}:{port}...")
+    local_spec = pathspec.PathSpec.from_lines('gitwildmatch', local_ignored)
+    server_spec = pathspec.PathSpec.from_lines('gitwildmatch', server_ignored)
+
+    print(f"\n{GRAY}Connecting to {CYAN}{username}@{host}:{port}{GRAY}...{RESET}")
     with Connection(
         host=host,
         user=username,
         port=port,
         connect_kwargs={"password": password},
     ) as c:
-        result = c.run("uname -s", hide=True, warn=True)
-        if not result.ok:
+        if not c.run("uname -s", hide=True, warn=True).ok:
             raise ConnectionError("SSH connection test failed.")
-        print("Connection OK")
+        print(f"{GREEN}Connection OK{RESET}")
 
-        if clear_mode == ClearDestinationMode.PURGE_ALL:
-            print("Purging destination directory...")
-            c.run(f'find "{destination}" -mindepth 1 -delete', hide=True, warn=True)
+        c.run(f'mkdir -p "{destination}"', hide=True)
 
-        print("Scanning local files...")
+        print(f"{GRAY}Scanning local files...{RESET}")
         local_map = {}
-        local_dirs = set()
         all_local_files = []
 
         for root, dirs, files in os.walk(source):
-            dirs[:] = [d for d in dirs if d not in ignored]
+            valid_dirs = []
             for d in dirs:
-                dir_full_path = os.path.join(root, d)
-                local_dirs.add(os.path.relpath(dir_full_path, source).replace(os.sep, "/"))
+                dir_rel_path = os.path.relpath(os.path.join(root, d), source).replace(os.sep, "/")
+                if not (local_spec.match_file(dir_rel_path) or local_spec.match_file(f"{dir_rel_path}/")):
+                    valid_dirs.append(d)
+            dirs[:] = valid_dirs
+
             for f in files:
-                if f not in ignored:
+                file_rel_path = os.path.relpath(os.path.join(root, f), source).replace(os.sep, "/")
+                if not local_spec.match_file(file_rel_path):
                     all_local_files.append((root, f))
 
-        for root, file in tqdm(all_local_files, desc="Hashing local files", unit="file"):
+        for root, file in tqdm(all_local_files, desc="Hashing local files", unit="file", bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt}"):
             full_path = os.path.join(root, file)
             rel_path = os.path.relpath(full_path, source).replace(os.sep, "/")
             local_map[rel_path] = (full_path, calculate_local_md5(full_path))
 
-        print("Fetching remote state...")
+        print(f"{GRAY}Fetching remote state...{RESET}")
         remote_map = get_remote_md5_map(c, destination)
 
-        updated_files = []
-        unchanged_files = []
-        deleted_files = []
-        deleted_dirs = []
+        to_upload = []
+        to_delete = []
+        skipped_server = []
+        unchanged = []
+
+        if mode in (Mode.CLEAR, Mode.CLEAR_FORCE):
+            for remote_file in remote_map:
+                if mode == Mode.CLEAR and server_spec.match_file(remote_file):
+                    skipped_server.append((remote_file, "Protected by SERVER ignore rule (Skip Delete)"))
+                else:
+                    to_delete.append(remote_file)
 
         for rel_path, (full_path, local_hash) in local_map.items():
-            if rel_path not in remote_map or remote_map[rel_path] != local_hash:
-                updated_files.append(rel_path)
+            needs_upload = False
+            
+            if mode in (Mode.REWRITE, Mode.REWRITE_FORCE, Mode.CLEAR, Mode.CLEAR_FORCE):
+                needs_upload = True
+            elif rel_path not in remote_map or remote_map[rel_path] != local_hash:
+                needs_upload = True
             else:
-                unchanged_files.append(rel_path)
+                unchanged.append(rel_path)
 
-        if clear_mode == ClearDestinationMode.SYNC_DELETE:
-            for rel_path in remote_map:
-                path_parts = set(rel_path.split("/"))
-                if rel_path not in local_map and not (path_parts & ignored):
-                    deleted_files.append(rel_path)
+            if needs_upload:
+                if mode in (Mode.UPDATE, Mode.REWRITE, Mode.CLEAR) and server_spec.match_file(rel_path):
+                    skipped_server.append((rel_path, "Protected by SERVER ignore rule (Skip Upload)"))
+                else:
+                    to_upload.append(rel_path)
 
-            remote_dirs = get_remote_dirs(c, destination)
-            for r_dir in remote_dirs:
-                dir_parts = set(r_dir.split("/"))
-                if r_dir not in local_dirs and not (dir_parts & ignored):
-                    deleted_dirs.append(r_dir)
-            deleted_dirs.sort(key=lambda x: x.count("/"), reverse=True)
+        print(f"\n{YELLOW}=== DEPLOYMENT PLAN (Mode: {mode.value}) ==={RESET}")
+        
+        if to_upload:
+            print(f"\n{GREEN}[TO UPLOAD / UPDATE] ({len(to_upload)}):{RESET}")
+            for f in to_upload:
+                print(f"  {GREEN}+{RESET} {f}")
+        
+        if to_delete:
+            print(f"\n{RED}[TO DELETE] ({len(to_delete)}):{RESET}")
+            for f in to_delete:
+                print(f"  {RED}-{RESET} {f}")
+                
+        if skipped_server:
+            print(f"\n{ORANGE}[PROTECTED ON SERVER (SKIPPED)] ({len(skipped_server)}):{RESET}")
+            for f, reason in skipped_server:
+                print(f"  {ORANGE}*{RESET} {f} {GRAY}- {reason}{RESET}")
+                
+        if unchanged and not preview:
+            print(f"\n{GRAY}[UNCHANGED] ({len(unchanged)}):{RESET}")
+            
+        print(f"{YELLOW}{'=' * 50}{RESET}\n")
 
-        if updated_files:
+        if preview:
+            choice = input(f"{YELLOW}Do you want to proceed with these changes? [y/N]: {RESET}").strip().lower()
+            if choice not in ('y', 'yes'):
+                print(f"{RED}Deployment aborted by user.{RESET}")
+                return
+
+        if to_delete:
+            for rel_path in tqdm(to_delete, desc="Deleting old files", unit="file", colour="red"):
+                c.run(f'rm -f "{destination}/{rel_path}"', hide=True)
+                
+            c.run(f'find "{destination}" -mindepth 1 -type d -empty -delete', hide=True, warn=True)
+
+        if to_upload:
             with SCPClient(c.client.get_transport()) as scp:
-                for rel_path in tqdm(updated_files, desc="Uploading files", unit="file"):
+                for rel_path in tqdm(to_upload, desc="Uploading files", unit="file", colour="green"):
                     local_full_path, _ = local_map[rel_path]
                     remote_file_path = f"{destination}/{rel_path}"
                     remote_folder = os.path.dirname(remote_file_path).replace(os.sep, "/")
                     c.run(f'mkdir -p "{remote_folder}"', hide=True)
                     scp.put(local_full_path, remote_path=remote_file_path)
 
-        if clear_mode == ClearDestinationMode.SYNC_DELETE:
-            if deleted_files:
-                for rel_path in tqdm(deleted_files, desc="Deleting old files", unit="file"):
-                    c.run(f'rm -f "{destination}/{rel_path}"', hide=True)
+        should_run_actions = False
+        if action_condition == ActionCondition.ALWAYS:
+            should_run_actions = True
+        elif action_condition == ActionCondition.ON_CLEAR and mode in (Mode.CLEAR, Mode.CLEAR_FORCE):
+            should_run_actions = True
+        elif action_condition == ActionCondition.ON_UPDATE and (to_upload or to_delete):
+            should_run_actions = True
 
-            if deleted_dirs:
-                for rel_dir in tqdm(deleted_dirs, desc="Deleting old dirs", unit="dir"):
-                    c.run(f'rm -rf "{destination}/{rel_dir}"', hide=True)
+        if should_run_actions and action_after:
+            print(f"\n{CYAN}Executing post-deploy action...{RESET}")
+            c.run(f'cd "{destination}" && {action_after}')
+            print(f"{GREEN}Action command sent.{RESET}")
 
-        print("\n" + "=" * 50)
-        print(f"DEPLOYMENT REPORT (Mode: {clear_mode.name} = {clear_mode.value})")
-        print("=" * 50)
-        print(f"\n[UPDATED / ADDED] ({len(updated_files)}):")
-        for f in updated_files:
-            print(f"  + {f}")
-
-        if clear_mode == ClearDestinationMode.SYNC_DELETE:
-            print(f"\n[DELETED FILES] ({len(deleted_files)}):")
-            for f in deleted_files:
-                print(f"  - {f}")
-            print(f"\n[DELETED DIRECTORIES] ({len(deleted_dirs)}):")
-            for d in deleted_dirs:
-                print(f"  - [DIR] {d}")
-        elif clear_mode == ClearDestinationMode.PURGE_ALL:
-            print("\n[DELETED]: All prior destination content wiped completely before sync.")
-        else:
-            print("\n[DELETED]: None (KEEP_ALL mode).")
-
-        print(f"\n[UNCHANGED] ({len(unchanged_files)}):")
-        for f in unchanged_files:
-            print(f"    {f}")
-        print("=" * 50 + "\n")
-
-        if restart_file:
-            print(f"Triggering restart via {restart_file}...")
-            c.run(f'touch "{destination}/{restart_file}"')
-            print("Restart triggered OK")
+            if action_check:
+                print(f"{GRAY}Executing action check...{RESET}")
+                result = c.run(f'cd "{destination}" && {action_check}', warn=True)
+                if not result.ok:
+                    sys.exit(1)
+        elif action_after:
+            print(f"\n{GRAY}Skipping post-deploy action (Condition: {action_condition.value} not met).{RESET}")
 
 
 def main():
+    if sys.platform == "win32":
+        os.system("color")
+
     parser = argparse.ArgumentParser(description="Deploy project via Fabric and SCP with MD5 sync.")
-    parser.add_argument("--configfile", help="Path to Python config file (e.g. config.py)")
-    parser.add_argument("--host", help="Remote SSH host")
-    parser.add_argument("--port", type=int, help="Remote SSH port (default: 22)")
-    parser.add_argument("--username", help="Remote SSH username")
-    parser.add_argument("--service", help="Keyring service name for password lookup")
-    parser.add_argument("--source", help="Local source directory")
-    parser.add_argument("--destination", help="Remote destination path")
-    parser.add_argument(
-        "--mode",
-        type=int,
-        choices=[0, 1, 2],
-        help="0: KEEP_ALL, 1: SYNC_DELETE, 2: PURGE_ALL",
-    )
-    parser.add_argument(
-        "--restart-file",
-        help="File to touch for restarting (empty string to disable)",
-    )
+    parser.add_argument("--configfile")
+    parser.add_argument("--host")
+    parser.add_argument("--port", type=int)
+    parser.add_argument("--username")
+    parser.add_argument("--service")
+    parser.add_argument("--source")
+    parser.add_argument("--destination")
+    parser.add_argument("--mode", type=str, choices=[m.value for m in Mode])
+    parser.add_argument("--action-condition", type=str, choices=[a.value for a in ActionCondition])
+    parser.add_argument("--action-after")
+    parser.add_argument("--action-check")
+    parser.add_argument("--preview", action="store_true")
 
     args = parser.parse_args()
 
-    file_config = {}
-    if args.configfile:
-        try:
-            file_config = load_config_file(args.configfile)
-        except Exception as e:
-            print(f"Config Error: {e}", file=sys.stderr)
-            sys.exit(1)
+    global_config = {}
+    global_config_path = os.path.join(get_program_dir(), "config.py")
+    if os.path.exists(global_config_path):
+        global_config = load_config_file(global_config_path)
 
-    host = args.host or file_config.get("host")
-    port = args.port or file_config.get("port") or 22
-    username = args.username or file_config.get("username")
-    service = args.service or file_config.get("service")
-    source = args.source or file_config.get("source")
-    destination = args.destination or file_config.get("destination")
-    mode_raw = (
-        args.mode
-        if args.mode is not None
-        else file_config.get("clear_mode", ClearDestinationMode.SYNC_DELETE.value)
-    )
-    restart_file = (
-        args.restart_file
-        if args.restart_file is not None
-        else file_config.get("restart_file", ".restart-app")
-    )
+    project_config = {}
+    if args.configfile:
+        project_config = load_config_file(args.configfile)
+
+    def get_val(arg_val, key, default=None):
+        if arg_val is not None: return arg_val
+        if key in project_config: return project_config[key]
+        if key in global_config: return global_config[key]
+        return default
+
+    host = get_val(args.host, "host")
+    port = get_val(args.port, "port", 22)
+    username = get_val(args.username, "username")
+    service = get_val(args.service, "service")
+    source = get_val(args.source, "source")
+    destination = get_val(args.destination, "destination")
+    mode_val = get_val(args.mode, "mode", Mode.UPDATE.value)
+    action_condition_val = get_val(args.action_condition, "action_condition", ActionCondition.ON_UPDATE.value)
+    action_after = get_val(args.action_after, "action_after", "")
+    action_check = get_val(args.action_check, "action_check", "")
+    preview = args.preview or get_val(False, "preview", False)
+
+    default_ignored_local = global_config.get("default_ignored_local", FALLBACK_IGNORED_LOCAL)
+    custom_ignored_local = project_config.get("custom_ignored_local", [])
+    merged_local = list(default_ignored_local) + list(custom_ignored_local)
+
+    default_ignored_server = global_config.get("default_ignored_server", FALLBACK_IGNORED_SERVER)
+    custom_ignored_server = project_config.get("custom_ignored_server", [])
+    merged_server = list(default_ignored_server) + list(custom_ignored_server)
 
     missing = []
-    if not host:
-        missing.append("--host")
-    if not username:
-        missing.append("--username")
-    if not service:
-        missing.append("--service")
-    if not source:
-        missing.append("--source")
-    if not destination:
-        missing.append("--destination")
+    if not host: missing.append("--host")
+    if not username: missing.append("--username")
+    if not service: missing.append("--service")
+    if not source: missing.append("--source")
+    if not destination: missing.append("--destination")
 
     if missing:
-        print(f"Error: Missing required parameters: {', '.join(missing)}", file=sys.stderr)
-        print("Provide them via CLI arguments or through --configfile.", file=sys.stderr)
+        print(f"{RED}Error: Missing required parameters: {', '.join(missing)}{RESET}", file=sys.stderr)
         sys.exit(1)
 
     try:
@@ -292,11 +357,16 @@ def main():
             service=service,
             source=source,
             destination=destination,
-            clear_mode=ClearDestinationMode(int(mode_raw)),
-            restart_file=restart_file,
+            mode=Mode(mode_val),
+            action_condition=ActionCondition(action_condition_val),
+            action_after=action_after,
+            action_check=action_check,
+            preview=preview,
+            local_ignored=merged_local,
+            server_ignored=merged_server,
         )
     except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
+        print(f"{RED}Fatal Error: {e}{RESET}", file=sys.stderr)
         sys.exit(1)
 
 

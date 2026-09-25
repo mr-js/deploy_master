@@ -1,3 +1,3 @@
-from .main import ClearDestinationMode, deploy
+from .main import Mode, deploy
 
-__all__ = ["deploy", "ClearDestinationMode"]
+__all__ = ["deploy", "Mode"]
